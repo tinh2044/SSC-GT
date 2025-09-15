@@ -9,10 +9,10 @@ data:
 
 model:
   in_ch: 3 
-  d_h: 256 
+  d_h: 128 
   p_h: 8 
   s_h: 4 
-  d_l: 256 
+  d_l: 128 
   p_l: 32 
   window_size: 7
 

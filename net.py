@@ -40,7 +40,8 @@ class MultiScaleTokenizer(nn.Module):
     def __init__(self, in_ch=3, d_h=128, p_h=8, s_h=None, d_l=128, p_l=32):
         super().__init__()
         self.p_h = p_h
-        self.s_h = s_h if s_h is not None else max(1, p_h // 2)
+        # Remove overlap by default: stride equals patch size to reduce token count and FLOPs
+        self.s_h = s_h if s_h is not None else p_h
         self.p_l = p_l
 
         self.conv_h = nn.Conv2d(
@@ -106,6 +107,7 @@ class SALA(nn.Module):
         num_heads: int = None,
         window_size: int = 7,
         patch_size: int = 8,
+        spectral_stride: int = 1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -133,6 +135,9 @@ class SALA(nn.Module):
         # gating between spatial & spectral
         self.alpha = nn.Parameter(torch.tensor(0.5))
         self.window_size = window_size
+        # Downsample factor for spectral attention to reduce global O(N^2) cost
+        # When >1, compute spectral attention on a strided grid and upsample back
+        self.spectral_stride = max(1, spectral_stride)
 
     def dct_on_patches(self, patches: torch.Tensor):
         """
@@ -229,7 +234,30 @@ class SALA(nn.Module):
     def forward(self, tokens: torch.Tensor, patches: torch.Tensor, H: int, W: int):
         sp_out = self.local_window_attention(tokens, H, W)  # (B,N,d)
         spec_desc = self.dct_on_patches(patches)  # (B,N,d)
-        spec_out = self.spectral_attention(spec_desc)  # (B,N,d)
+        if self.spectral_stride > 1 and (H * W) > 0:
+            # Downsample descriptors on token grid, run attention, then upsample back
+            B, N, D = spec_desc.shape
+            s = self.spectral_stride
+            # reshape to B,H,W,D
+            spec_hw = spec_desc.view(B, H, W, D)
+            # strided sampling
+            Hs = (H + s - 1) // s
+            Ws = (W + s - 1) // s
+            spec_ds = spec_hw[:, ::s, ::s, :]  # (B,Hs,Ws,D)
+            spec_ds = spec_ds.contiguous().view(B, Hs * Ws, D)
+            spec_out_ds = self.spectral_attention(spec_ds)  # (B,Hs*Ws,D)
+            # upsample back to H,W
+            spec_out_ds = (
+                spec_out_ds.view(B, Hs, Ws, D).permute(0, 3, 1, 2).contiguous()
+            )
+            spec_out_full = (
+                F.interpolate(spec_out_ds, size=(H, W), mode="nearest")
+                .permute(0, 2, 3, 1)
+                .contiguous()
+            )
+            spec_out = spec_out_full.view(B, N, D)
+        else:
+            spec_out = self.spectral_attention(spec_desc)  # (B,N,d)
         alpha = torch.sigmoid(self.alpha)
         fused = alpha * sp_out + (1 - alpha) * spec_out
         out = tokens + fused
@@ -481,11 +509,16 @@ class PatchDecoder(nn.Module):
 class MaskHead(nn.Module):
     def __init__(self, in_ch: int):
         super().__init__()
+        # Lightweight head: 1x1 bottleneck -> depthwise 3x3 -> 1x1 to mask
+        mid = max(16, in_ch // 4)
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(in_ch),
+            nn.Conv2d(in_ch, mid, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid),
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_ch, 1, kernel_size=1),
+            nn.Conv2d(mid, mid, kernel_size=3, padding=1, groups=mid, bias=False),
+            nn.BatchNorm2d(mid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid, 1, kernel_size=1),
             nn.Sigmoid(),
         )
 
@@ -502,30 +535,41 @@ class SSC_GT(nn.Module):
             in_ch=in_ch, d_h=d_h, p_h=p_h, s_h=s_h, d_l=d_l, p_l=p_l
         )
         self.sala_h = SALA(
-            d_model=d_h, head_dim=32, window_size=window_size, patch_size=p_h
+            d_model=d_h,
+            head_dim=32,
+            window_size=window_size,
+            patch_size=p_h,
+            spectral_stride=2,
         )
         self.sala_l = SALA(
             d_model=d_l,
             head_dim=32,
             window_size=max(3, window_size // 2),
             patch_size=p_l,
+            spectral_stride=1,
         )
         self.acga_h = ACGA(token_dim=d_h, node_dim=64, max_nodes=64)
         self.acga_l = ACGA(token_dim=d_l, node_dim=64, max_nodes=64)
         self.bacep = BACEP(p_h=p_h, token_stride=self.tokenizer.s_h)
         self.adpd = ADPD(d_h=d_h, d_l=d_l)
-        self.decoder = PatchDecoder(d_token=d_h, patch_size=p_h, out_channels=128)
+        # Reduce decoder channels to shrink full-res compute
+        self.decoder = PatchDecoder(d_token=d_h, patch_size=p_h, out_channels=64)
+        # Depthwise-separable fusion with bottleneck
+        fusion_in_ch = 64 + d_l
         self.fusion_conv = nn.Sequential(
-            nn.Conv2d(128 + d_l, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(fusion_in_ch, 96, kernel_size=1, bias=False),
+            nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 128, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(96, 96, kernel_size=3, padding=1, groups=96, bias=False),
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(96, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
         self.head_low = MaskHead(in_ch=d_l)
-        self.head_high = MaskHead(in_ch=128)
-        self.head_fusion = MaskHead(in_ch=128)
+        self.head_high = MaskHead(in_ch=64)
+        self.head_fusion = MaskHead(in_ch=64)
 
     def forward(self, img: torch.Tensor):
         t = self.tokenizer(img)
