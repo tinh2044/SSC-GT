@@ -38,7 +38,7 @@ def train_one_epoch(
         # Save sample images
         if batch_idx % (print_freq * 5) == 0 and hasattr(args, "output_dir"):
             save_sample_images(
-                inputs, outputs, targets, batch_idx, epoch, args.output_dir
+                inputs, outputs[2], targets, batch_idx, epoch, args.output_dir
             )
 
     # Gather the stats from all processes
