@@ -333,28 +333,24 @@ def get_model_info(model, input_shape, device) -> dict:
     info["trainable_params"] = trainable_params
     info["non_trainable_params"] = total_params - trainable_params
 
+    # Try to compute FLOPs and MACs using fvcore if available
     try:
-        from thop import profile, clever_format
+        from fvcore.nn import FlopCountAnalysis
 
-        dummy_input = torch.randn(*input_shape, device=device)
-        model_was_training = model.training
-        model.eval()
-        with torch.no_grad():
-            flops, macs = profile(model, inputs=(dummy_input,), verbose=False)
-        if model_was_training:
-            model.train()
-        flops_str, macs_str = clever_format([flops, macs], "%.3f")
+        dummy_input = torch.randn(input_shape).to(device)
+
+        flops = FlopCountAnalysis(model, dummy_input)
+        flops_total = flops.total()
+        flops_str = f"{flops_total / 1e9:.3f} GFLOPs"
         info.update(
             {
-                "flops": int(flops),
-                "macs": int(macs),
+                "flops": int(flops_total),
                 "flops_str": flops_str,
-                "macs_str": macs_str,
-                "params_str": clever_format([total_params], "%.3f")[0],
+                "params_str": f"{total_params:,.3f}",
             }
         )
     except Exception:
-        # thop not available or failed; ignore
+        # fvcore not available or failed; ignore
         pass
 
     return info

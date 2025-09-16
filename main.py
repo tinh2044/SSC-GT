@@ -163,8 +163,6 @@ def main(args, cfg):
 
         if "flops" in model_info:
             print(f"  FLOPs: {model_info['flops_str']}")
-            print(f"  MACs: {model_info['macs_str']}")
-            print(f"  Parameters (from thop): {model_info['params_str']}")
         print()
 
     if args.finetune:

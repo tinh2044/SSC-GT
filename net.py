@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from encoder import Encoder
+
 
 def make_dct_basis(n: int, device=None, dtype=torch.float32):
     """Create DCT-II orthonormal basis matrix (n x n)."""
@@ -36,68 +38,10 @@ def fold_patches(
     )
 
 
-class MultiScaleTokenizer(nn.Module):
-    def __init__(self, in_ch=3, d_h=128, p_h=8, s_h=None, d_l=128, p_l=32):
-        super().__init__()
-        self.p_h = p_h
-        # Remove overlap by default: stride equals patch size to reduce token count and FLOPs
-        self.s_h = s_h if s_h is not None else p_h
-        self.p_l = p_l
-
-        self.conv_h = nn.Conv2d(
-            in_ch, d_h, kernel_size=p_h, stride=self.s_h, padding=0, bias=False
-        )
-        self.norm_h = nn.LayerNorm(d_h)
-        self.conv_l = nn.Conv2d(
-            in_ch, d_l, kernel_size=p_l, stride=p_l, padding=0, bias=False
-        )
-        self.norm_l = nn.LayerNorm(d_l)
-
-        nn.init.kaiming_normal_(self.conv_h.weight, a=0, mode="fan_out")
-        nn.init.kaiming_normal_(self.conv_l.weight, a=0, mode="fan_out")
-
-    def forward(self, x: torch.Tensor):
-        B, C, H0, W0 = x.shape
-
-        feat_h = self.conv_h(x)  # (B,d_h,H_h,W_h)
-        B_, d_h, H_h, W_h = feat_h.shape
-        tokens_h = feat_h.flatten(2).transpose(1, 2).contiguous()  # (B,N_h,d_h)
-        tokens_h = self.norm_h(tokens_h)
-        patches_h = unfold_patches(
-            x, kernel_size=self.p_h, stride=self.s_h
-        )  # (B, 3*p_h*p_h, N_h)
-
-        feat_l = self.conv_l(x)
-        _, d_l, H_l, W_l = feat_l.shape
-        tokens_l = feat_l.flatten(2).transpose(1, 2).contiguous()
-        tokens_l = self.norm_l(tokens_l)
-        patches_l = unfold_patches(x, kernel_size=self.p_l, stride=self.p_l)
-
-        return {
-            "feat_h_map": feat_h,
-            "tokens_h": tokens_h,
-            "patches_h": patches_h,
-            "H_h": H_h,
-            "W_h": W_h,
-            "feat_l_map": feat_l,
-            "tokens_l": tokens_l,
-            "patches_l": patches_l,
-            "H_l": H_l,
-            "W_l": W_l,
-            "H0": H0,
-            "W0": W0,
-            "s_h": self.s_h,
-            "p_h": self.p_h,
-            "p_l": self.p_l,
-        }
-
-
 class SALA(nn.Module):
     """
-    SALA: combines local windowed multi-head attention and global spectral attention (DCT).
-    Input:
-      tokens: (B,N,d)
-      patches: (B, 3*ks*ks, N)  (raw RGB patches)
+    SALA: Local window attention directly on feature maps (B,C,H,W).
+    Spectral branch omitted to avoid patch dependence; returns (B,C,H,W).
     """
 
     def __init__(
@@ -106,8 +50,6 @@ class SALA(nn.Module):
         head_dim: int = 32,
         num_heads: int = None,
         window_size: int = 7,
-        patch_size: int = 8,
-        spectral_stride: int = 1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -116,152 +58,61 @@ class SALA(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         assert self.head_dim * self.num_heads == d_model
-
-        # spatial projections
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        # spectral path
-        self.p_size = patch_size
-        self.register_buffer("dct_basis", make_dct_basis(self.p_size))
-        self.spec_proj = nn.Linear(3 * self.p_size * self.p_size, d_model)
-        self.spec_q = nn.Linear(d_model, d_model)
-        self.spec_k = nn.Linear(d_model, d_model)
-        self.spec_v = nn.Linear(d_model, d_model)
-        self.spec_out = nn.Linear(d_model, d_model)
-
-        # gating between spatial & spectral
-        self.alpha = nn.Parameter(torch.tensor(0.5))
         self.window_size = window_size
-        # Downsample factor for spectral attention to reduce global O(N^2) cost
-        # When >1, compute spectral attention on a strided grid and upsample back
-        self.spectral_stride = max(1, spectral_stride)
 
-    def dct_on_patches(self, patches: torch.Tensor):
-        """
-        patches: (B, 3*ks*ks, N)
-        returns: (B, N, d_model)
-        """
-        B, Cks, N = patches.shape
-        ks = self.p_size
-        assert Cks == 3 * ks * ks
-        device = patches.device
-        # reshape to (B,3,ks,ks,N)
-        patches = patches.view(B, 3, ks, ks, N)
-        Bmat = self.dct_basis.to(device=device, dtype=patches.dtype)  # (ks,ks)
+        # 1x1 conv projections for q, k, v and output
+        self.q_proj = nn.Conv2d(d_model, d_model, kernel_size=1, bias=False)
+        self.k_proj = nn.Conv2d(d_model, d_model, kernel_size=1, bias=False)
+        self.v_proj = nn.Conv2d(d_model, d_model, kernel_size=1, bias=False)
+        self.out_proj = nn.Conv2d(d_model, d_model, kernel_size=1, bias=False)
+        self.norm = nn.BatchNorm2d(d_model)
 
-        # compute DCT per-sample in batch (vectorized using einsum)
-        # p: (B,3,ks,ks,N) -> apply Bmat over spatial dims
-        # First multiply left: (ks,ks) x (3,ks,ks,N) -> (3,ks,ks,N)
-        # Use einsum to broadcast matmul across appropriate dims:
-        # result shape after two einsums -> (B,3,ks,ks,N) then flatten to (B,N,3*ks*ks)
-        F_ch = torch.einsum("ij, b c j k n -> b c i k n", Bmat, patches)
-        F_ch = torch.einsum("b c i j n, k j -> b c i k n", F_ch, Bmat.t())
-        F_flat = F_ch.reshape(B, 3 * ks * ks, N).permute(0, 2, 1)  # (B, N, 3*ks*ks)
-        spec_desc = self.spec_proj(F_flat)  # (B,N,d_model)
-        return spec_desc
-
-    def local_window_attention(self, tokens: torch.Tensor, H: int, W: int):
-        """
-        tokens: (B,N,d)
-        returns: (B,N,d)
-        """
-        B, N, d = tokens.shape
-        assert N == H * W
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.shape
         ws = self.window_size
         pad_h = (ws - (H % ws)) % ws
         pad_w = (ws - (W % ws)) % ws
-        x = tokens.reshape(B, H, W, d)  # safe reshape
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
         if pad_h > 0 or pad_w > 0:
-            x = F.pad(x.permute(0, 3, 1, 2), (0, pad_w, 0, pad_h)).permute(0, 2, 3, 1)
-            Hp = H + pad_h
-            Wp = W + pad_w
-        else:
-            Hp, Wp = H, W
+            q = F.pad(q, (0, pad_w, 0, pad_h))
+            k = F.pad(k, (0, pad_w, 0, pad_h))
+            v = F.pad(v, (0, pad_w, 0, pad_h))
+        Hp, Wp = q.shape[-2], q.shape[-1]
 
-        # group windows and compute attention per window
-        xw = (
-            x.reshape(B, Hp // ws, ws, Wp // ws, ws, d)
-            .permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-        )
-        Bn, Wh, Ww, ws1, ws2, d = xw.shape
-        xw = xw.reshape(B * (Hp // ws) * (Wp // ws), ws * ws, d)
+        # reshape into windows and heads
+        def to_windows(t: torch.Tensor):
+            t = t.view(B, self.num_heads, self.head_dim, Hp, Wp)
+            t = t.unfold(3, ws, ws).unfold(4, ws, ws)  # (B,heads,hd, nH, nW, ws, ws)
+            nH, nW = t.shape[3], t.shape[4]
+            t = t.permute(0, 1, 3, 4, 2, 5, 6).contiguous()  # (B,heads,nH,nW,hd,ws,ws)
+            t = t.view(B, self.num_heads, nH * nW, self.head_dim, ws * ws)
+            t = t.permute(0, 1, 2, 4, 3).contiguous()  # (B,heads,nWin,T,hd)
+            return t, nH, nW
 
-        q = self.q_proj(xw)
-        k = self.k_proj(xw)
-        v = self.v_proj(xw)
-        # multi-head
-        q = q.view(q.shape[0], q.shape[1], self.num_heads, self.head_dim).permute(
-            0, 2, 1, 3
-        )
-        k = k.view(k.shape[0], k.shape[1], self.num_heads, self.head_dim).permute(
-            0, 2, 1, 3
-        )
-        v = v.view(v.shape[0], v.shape[1], self.num_heads, self.head_dim).permute(
-            0, 2, 1, 3
-        )
+        q_w, nH, nW = to_windows(q)
+        k_w, _, _ = to_windows(k)
+        v_w, _, _ = to_windows(v)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = torch.matmul(q_w, k_w.transpose(-2, -1)) * scale  # (B,heads,nWin,T,T)
         attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
-        out = out.permute(0, 2, 1, 3).contiguous().reshape(xw.shape[0], xw.shape[1], d)
-        out = self.out_proj(out)
+        out_w = torch.matmul(attn, v_w)  # (B,heads,nWin,T,hd)
 
+        # fold windows back
+        out_w = out_w.permute(0, 1, 4, 2, 3).contiguous()  # (B,heads,hd,nWin,T)
+        out_w = out_w.view(B, self.num_heads * self.head_dim, nH, nW, ws, ws)
         out = (
-            out.reshape(B, Hp // ws, Wp // ws, ws, ws, d)
-            .permute(0, 1, 3, 2, 4, 5)
+            out_w.permute(0, 1, 2, 4, 3, 5)
             .contiguous()
+            .view(B, self.num_heads * self.head_dim, nH * ws, nW * ws)
         )
-        out = out.reshape(B, Hp, Wp, d)
-        out = out[:, :H, :W, :].contiguous().reshape(B, H * W, d)
-        return out
-
-    def spectral_attention(self, spec_desc: torch.Tensor):
-        q = self.spec_q(spec_desc)
-        k = self.spec_k(spec_desc)
-        v = self.spec_v(spec_desc)
-        scale = 1.0 / math.sqrt(self.d_model)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
-        out = self.spec_out(out)
-        return out
-
-    def forward(self, tokens: torch.Tensor, patches: torch.Tensor, H: int, W: int):
-        sp_out = self.local_window_attention(tokens, H, W)  # (B,N,d)
-        spec_desc = self.dct_on_patches(patches)  # (B,N,d)
-        if self.spectral_stride > 1 and (H * W) > 0:
-            # Downsample descriptors on token grid, run attention, then upsample back
-            B, N, D = spec_desc.shape
-            s = self.spectral_stride
-            # reshape to B,H,W,D
-            spec_hw = spec_desc.view(B, H, W, D)
-            # strided sampling
-            Hs = (H + s - 1) // s
-            Ws = (W + s - 1) // s
-            spec_ds = spec_hw[:, ::s, ::s, :]  # (B,Hs,Ws,D)
-            spec_ds = spec_ds.contiguous().view(B, Hs * Ws, D)
-            spec_out_ds = self.spectral_attention(spec_ds)  # (B,Hs*Ws,D)
-            # upsample back to H,W
-            spec_out_ds = (
-                spec_out_ds.view(B, Hs, Ws, D).permute(0, 3, 1, 2).contiguous()
-            )
-            spec_out_full = (
-                F.interpolate(spec_out_ds, size=(H, W), mode="nearest")
-                .permute(0, 2, 3, 1)
-                .contiguous()
-            )
-            spec_out = spec_out_full.view(B, N, D)
-        else:
-            spec_out = self.spectral_attention(spec_desc)  # (B,N,d)
-        alpha = torch.sigmoid(self.alpha)
-        fused = alpha * sp_out + (1 - alpha) * spec_out
-        out = tokens + fused
-        out = F.layer_norm(out, out.shape[-1:])
+        out = out[:, :, :H, :W]
+        out = self.out_proj(out)
+        out = self.norm(x + out)
         return out
 
 
@@ -281,59 +132,57 @@ class TwoLayerGCN(nn.Module):
 
 
 class ACGA(nn.Module):
+    """
+    ACGA: operate directly on feature map (B,C,H,W).
+    - Score per spatial location with 1x1 conv.
+    - Select top-M spatial nodes per sample.
+    - Build cosine adjacency and run 2-layer GCN in node space.
+    - Broadcast back to full map via attention (conv projections), reshape to (B,C,H,W).
+    """
+
     def __init__(
         self,
-        token_dim: int,
+        in_channels: int,
         node_dim: int = 64,
         max_nodes: int = 64,
         score_hidden: int = 64,
     ):
         super().__init__()
-        self.token_dim = token_dim
+        self.in_channels = in_channels
         self.node_dim = node_dim
         self.max_nodes = max_nodes
-        self.score_mlp = nn.Sequential(
-            nn.Linear(token_dim, score_hidden),
+        self.score_conv = nn.Sequential(
+            nn.Conv2d(in_channels, score_hidden, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Linear(score_hidden, 1),
+            nn.Conv2d(score_hidden, 1, kernel_size=1),
         )
-        self.t2n = nn.Linear(token_dim, node_dim, bias=False)
-        self.n2t = nn.Linear(node_dim, token_dim, bias=False)
+        self.t2n = nn.Conv2d(in_channels, node_dim, kernel_size=1, bias=False)
+        self.n2t = nn.Conv2d(node_dim, in_channels, kernel_size=1, bias=False)
         self.gcn = TwoLayerGCN(node_dim)
 
-    def select_nodes(self, token_feats: torch.Tensor):
-        B, N, d = token_feats.shape
-        scores = self.score_mlp(token_feats).squeeze(-1)
-        means = scores.mean(dim=1, keepdim=True)
-        stds = scores.std(dim=1, unbiased=False, keepdim=True)
-        thr = means + 0.5 * stds
-        selected = scores > thr
-        nodes_list = []
-        idx_list = []
+    def select_nodes(self, fmap: torch.Tensor):
+        B, C, H, W = fmap.shape
+        scores = self.score_conv(fmap).view(B, -1)  # (B, H*W)
+        idxs = []
+        H0_list = []
+        proj = self.t2n(fmap)  # (B,node_dim,H,W)
         for b in range(B):
-            sel_idx = torch.nonzero(selected[b]).squeeze(-1)
-            if sel_idx.numel() == 0:
-                k = min(self.max_nodes, max(4, N // 16))
-                _, topk = torch.topk(scores[b], k=k)
-                sel_idx = topk
-            else:
-                if sel_idx.numel() > self.max_nodes:
-                    _, topk = torch.topk(scores[b][sel_idx], k=self.max_nodes)
-                    sel_idx = sel_idx[topk]
-            idx_list.append(sel_idx)
-            nodes_list.append(self.t2n(token_feats[b, sel_idx, :]))
-        M = max([n.shape[0] for n in nodes_list])
-        M = min(M, self.max_nodes)
-        H0 = token_feats.new_zeros((B, M, self.node_dim))
-        mask = torch.zeros(B, M, dtype=torch.bool, device=token_feats.device)
+            k = min(self.max_nodes, max(4, (H * W) // 16))
+            vals, topk = torch.topk(scores[b], k=k)
+            idxs.append(topk)
+            y = topk // W
+            x = topk % W
+            feats = proj[b, :, y, x].transpose(0, 1)  # (k, node_dim)
+            H0_list.append(feats)
+        M = max([h.shape[0] for h in H0_list])
+        H0 = fmap.new_zeros((B, M, self.node_dim))
+        mask = torch.zeros(B, M, dtype=torch.bool, device=fmap.device)
         for b in range(B):
-            cur = nodes_list[b]
-            cur_n = cur.shape[0]
-            take = min(cur_n, M)
+            cur = H0_list[b]
+            take = min(cur.shape[0], M)
             H0[b, :take, :] = cur[:take, :]
             mask[b, :take] = True
-            idx_list[b] = idx_list[b][:take]
-        return H0, mask, idx_list
+        return H0, mask, idxs, proj
 
     def adjacency_from_nodes(self, H_nodes: torch.Tensor, mask: torch.Tensor):
         B, M, d = H_nodes.shape
@@ -349,17 +198,23 @@ class ACGA(nn.Module):
         A_norm = A / rowsum
         return A_norm
 
-    def forward(self, token_feats: torch.Tensor):
-        B, N, d = token_feats.shape
-        H0, mask, idx_list = self.select_nodes(token_feats)
+    def forward(self, fmap: torch.Tensor):
+        B, C, H, W = fmap.shape
+        H0, mask, idxs, proj = self.select_nodes(fmap)  # H0: (B,M,node_dim)
         A = self.adjacency_from_nodes(H0, mask)
-        Hg = self.gcn(H0, A)
-        token_proj = self.t2n(token_feats)
-        logits = torch.matmul(token_proj, Hg.transpose(-2, -1))
-        attn = F.softmax(logits / math.sqrt(self.node_dim), dim=-1)
-        injected = torch.matmul(attn, Hg)
+        Hg = self.gcn(H0, A)  # (B,M,node_dim)
+        # Token-to-node attention via conv-projected features
+        tokens_proj = proj.view(B, self.node_dim, H * W).transpose(
+            1, 2
+        )  # (B,N,node_dim)
+        logits = torch.matmul(tokens_proj, Hg.transpose(1, 2)) / math.sqrt(
+            self.node_dim
+        )
+        attn = F.softmax(logits, dim=-1)  # (B,N,M)
+        injected = torch.matmul(attn, Hg)  # (B,N,node_dim)
+        injected = injected.transpose(1, 2).view(B, self.node_dim, H, W)
         back = self.n2t(injected)
-        out = token_feats + back
+        out = fmap + back
         return out
 
 
@@ -375,7 +230,8 @@ class BACEP(nn.Module):
         self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
         self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
         self.comb_conv = nn.Sequential(
-            nn.Conv2d(2, 8, kernel_size=3, padding=1),
+            nn.Conv2d(2, 8, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(8),
             nn.ReLU(inplace=True),
             nn.Conv2d(8, 1, kernel_size=1),
         )
@@ -393,13 +249,20 @@ class BACEP(nn.Module):
         feat_mag = feat_up.pow(2).mean(dim=1, keepdim=True)
         comb = torch.cat([edges, feat_mag], dim=1)
         mask_map = torch.sigmoid(self.comb_conv(comb))
-        patches = unfold_patches(mask_map, kernel_size=self.p_h, stride=self.stride)
-        e_tokens = patches.mean(dim=1)
-        return e_tokens.clamp(0.0, 1.0), mask_map
+        # Average mask into the token grid of size (H_h, W_h) to get one scalar per token map
+        e_map = F.adaptive_avg_pool2d(mask_map, output_size=(H_h, W_h))  # (B,1,H_h,W_h)
+        return e_map.clamp(0.0, 1.0), mask_map
 
 
 class CrossAttentionFuse(nn.Module):
-    def __init__(self, q_dim: int, kv_dim: int, out_dim: int, num_heads: int = 8):
+    def __init__(
+        self,
+        q_dim: int,
+        kv_dim: int,
+        out_dim: int,
+        num_heads: int = 8,
+        attn_q_chunk: int = 1024,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = out_dim // num_heads
@@ -408,6 +271,7 @@ class CrossAttentionFuse(nn.Module):
         self.k_proj = nn.Linear(kv_dim, out_dim, bias=False)
         self.v_proj = nn.Linear(kv_dim, out_dim, bias=False)
         self.out = nn.Linear(out_dim, out_dim)
+        self.attn_q_chunk = attn_q_chunk
 
     def forward(
         self,
@@ -437,9 +301,22 @@ class CrossAttentionFuse(nn.Module):
             wk = weight_K.unsqueeze(1).unsqueeze(-1)
             k = k * wk
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
+        # Chunked attention over queries to reduce peak memory
+        out_chunks = []
+        chunk = max(1, self.attn_q_chunk)
+        k_t = k.transpose(
+            -2, -1
+        )  # (B,heads,hd,Nk)-> but here (B,heads,Nk,hd)^T already used
+        for qs in range(0, Nq, chunk):
+            qe = min(Nq, qs + chunk)
+            q_chunk = q[:, :, qs:qe, :]  # (B,heads,qc,hd)
+            scores = (
+                torch.matmul(q_chunk, k.transpose(-2, -1)) * scale
+            )  # (B,heads,qc,Nk)
+            attn = F.softmax(scores, dim=-1)
+            out_chunk = torch.matmul(attn, v)  # (B,heads,qc,hd)
+            out_chunks.append(out_chunk)
+        out = torch.cat(out_chunks, dim=2)
         out = (
             out.permute(0, 2, 1, 3)
             .contiguous()
@@ -453,10 +330,10 @@ class ADPD(nn.Module):
     def __init__(self, d_h: int, d_l: int):
         super().__init__()
         self.coarse2fine_attn = CrossAttentionFuse(
-            q_dim=d_h, kv_dim=d_l, out_dim=d_h, num_heads=8
+            q_dim=d_h, kv_dim=d_l, out_dim=d_h, num_heads=8, attn_q_chunk=2048
         )
         self.fine2coarse_attn = CrossAttentionFuse(
-            q_dim=d_l, kv_dim=d_h, out_dim=d_l, num_heads=8
+            q_dim=d_l, kv_dim=d_h, out_dim=d_l, num_heads=8, attn_q_chunk=2048
         )
         self.ln_h = nn.LayerNorm(d_h)
         self.ln_l = nn.LayerNorm(d_l)
@@ -509,7 +386,6 @@ class PatchDecoder(nn.Module):
 class MaskHead(nn.Module):
     def __init__(self, in_ch: int):
         super().__init__()
-        # Lightweight head: 1x1 bottleneck -> depthwise 3x3 -> 1x1 to mask
         mid = max(16, in_ch // 4)
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, mid, kernel_size=1, bias=False),
@@ -526,35 +402,178 @@ class MaskHead(nn.Module):
         return self.net(fmap)
 
 
+class FIEMHead(nn.Module):
+    def __init__(self, ch_high: int, ch_low: int, mid_ch: int = 64, max_steps: int = 4):
+        super().__init__()
+        self.high_proj = nn.Sequential(
+            nn.Conv2d(ch_high, mid_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.low_proj = nn.Sequential(
+            nn.Conv2d(ch_low, mid_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.up_low = nn.ModuleList(
+            [UpSampling2x(mid_ch, mid_ch) for _ in range(max_steps)]
+        )
+        self.up_high = nn.ModuleList(
+            [UpSampling2x(mid_ch, mid_ch) for _ in range(max_steps)]
+        )
+        self.up_fuse = nn.ModuleList(
+            [UpSampling2x(mid_ch, mid_ch) for _ in range(max_steps)]
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(mid_ch * 2, mid_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                mid_ch, mid_ch, kernel_size=3, padding=1, groups=mid_ch, bias=False
+            ),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True),
+        )
+
+        self.head_high = MaskHead(in_ch=mid_ch)
+        self.head_low = MaskHead(in_ch=mid_ch)
+        self.head_fusion = MaskHead(in_ch=mid_ch)
+
+    def _steps(self, src: int, dst: int) -> int:
+        scale = max(1, dst // src)
+        return int(math.log2(scale)) if scale > 0 else 0
+
+    def forward(self, gh: torch.Tensor, gl: torch.Tensor, H0: int, W0: int):
+        B, Ch, Hh, Wh = gh.shape
+        _, Cl, Hl, Wl = gl.shape
+        xh = self.high_proj(gh)  # (B,mid,Hh,Wh)
+        xl = self.low_proj(gl)  # (B,mid,Hl,Wl)
+
+        steps_l2h = self._steps(Hl, Hh)
+        for i in range(steps_l2h):
+            xl = self.up_low[i](xl)
+
+        fuse = self.fuse(torch.cat([xh, xl], dim=1))  # (B,mid,Hh,Wh)
+
+        steps_h2in = self._steps(Hh, H0)
+        up_high = xh
+        up_fuse = fuse
+        for i in range(steps_h2in):
+            up_high = self.up_high[i](up_high)
+            up_fuse = self.up_fuse[i](up_fuse)
+
+        steps_l2in = self._steps(Hl, H0)
+        low_up = self.low_proj(gl)
+        for i in range(steps_l2in):
+            low_up = self.up_low[i](low_up)
+
+        high_mask = self.head_high(up_high)
+        low_mask = self.head_low(low_up)
+        fusion_mask = self.head_fusion(up_fuse)
+        return low_mask, high_mask, fusion_mask
+
+
+class UpSampling2x(nn.Module):
+    def __init__(self, in_chs, out_chs):
+        super(UpSampling2x, self).__init__()
+        temp_chs = out_chs * 4  # for PixelShuffle
+        self.up_module = nn.Sequential(
+            nn.Conv2d(in_chs, temp_chs, 1, bias=False),
+            nn.BatchNorm2d(temp_chs),
+            nn.ReLU(inplace=True),
+            nn.PixelShuffle(2),
+        )
+
+    def forward(self, features):
+        return self.up_module(features)
+
+
+class GroupFusion(nn.Module):
+    def __init__(self, in_chs, out_chs, end=False):  # 768, 384
+        super(GroupFusion, self).__init__()
+
+        if end:
+            tmp_chs = in_chs * 2
+        else:
+            tmp_chs = in_chs
+        self.gf1 = nn.Sequential(
+            nn.Conv2d(in_chs * 2, in_chs, 1, bias=False),
+            nn.BatchNorm2d(in_chs),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_chs, in_chs, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_chs),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_chs, in_chs, 3, padding=1, bias=False),
+            nn.BatchNorm2d(in_chs),
+            nn.ReLU(inplace=True),
+        )
+
+        self.gf2 = nn.Sequential(
+            nn.Conv2d(in_chs * 2, tmp_chs, 1, bias=False),
+            nn.BatchNorm2d(tmp_chs),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(tmp_chs, tmp_chs, 3, padding=1, bias=False),
+            nn.BatchNorm2d(tmp_chs),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(tmp_chs, tmp_chs, 3, padding=1, bias=False),
+            nn.BatchNorm2d(tmp_chs),
+            nn.ReLU(inplace=True),
+        )
+
+        self.gf3 = nn.Sequential(
+            nn.Conv2d(in_chs * 2, tmp_chs, 1, bias=False),
+            nn.BatchNorm2d(tmp_chs),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(tmp_chs, tmp_chs, 3, padding=1, bias=False),
+            nn.BatchNorm2d(tmp_chs),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(tmp_chs, tmp_chs, 3, padding=1, bias=False),
+            nn.BatchNorm2d(tmp_chs),
+            nn.ReLU(inplace=True),
+        )
+        self.up2x_1 = UpSampling2x(tmp_chs, out_chs)
+        self.up2x_2 = UpSampling2x(tmp_chs, out_chs)
+
+    def forward(self, f_up1, f_up2, f_down1, f_down2):  # [768,24,24]
+        fc1 = torch.cat((f_down1, f_down2), dim=1)
+        f_tmp = self.gf1(fc1)
+
+        out1 = self.gf2(torch.cat((f_tmp, f_up1), dim=1))
+        out2 = self.gf3(torch.cat((f_tmp, f_up2), dim=1))
+
+        return self.up2x_1(out1), self.up2x_2(out2)  # [384,48,48]
+
+
 class SSC_GT(nn.Module):
     def __init__(
-        self, in_ch=3, d_h=128, p_h=8, s_h=None, d_l=128, p_l=32, window_size=7
+        self,
+        in_ch=3,
+        d_h=128,
+        p_h=8,
+        s_h=None,
+        d_l=128,
+        p_l=32,
+        window_size=7,
+        encoder={},
     ):
         super().__init__()
-        self.tokenizer = MultiScaleTokenizer(
-            in_ch=in_ch, d_h=d_h, p_h=p_h, s_h=s_h, d_l=d_l, p_l=p_l
-        )
-        self.sala_h = SALA(
-            d_model=d_h,
-            head_dim=32,
-            window_size=window_size,
-            patch_size=p_h,
-            spectral_stride=2,
-        )
+        self.encoder = Encoder(**encoder)
+        self.sala_h = SALA(d_model=d_h, head_dim=32, window_size=window_size)
         self.sala_l = SALA(
-            d_model=d_l,
-            head_dim=32,
-            window_size=max(3, window_size // 2),
-            patch_size=p_l,
-            spectral_stride=1,
+            d_model=d_l, head_dim=32, window_size=max(3, window_size // 2)
         )
-        self.acga_h = ACGA(token_dim=d_h, node_dim=64, max_nodes=64)
-        self.acga_l = ACGA(token_dim=d_l, node_dim=64, max_nodes=64)
-        self.bacep = BACEP(p_h=p_h, token_stride=self.tokenizer.s_h)
+        self.acga_h = ACGA(in_channels=d_h, node_dim=64, max_nodes=64)
+        self.acga_l = ACGA(in_channels=d_l, node_dim=64, max_nodes=64)
+        self.bacep = BACEP(p_h=p_h, token_stride=p_h)
         self.adpd = ADPD(d_h=d_h, d_l=d_l)
-        # Reduce decoder channels to shrink full-res compute
-        self.decoder = PatchDecoder(d_token=d_h, patch_size=p_h, out_channels=64)
-        # Depthwise-separable fusion with bottleneck
+        self.high_proj = nn.Sequential(
+            nn.Conv2d(d_h, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.up_high = nn.ModuleList([UpSampling2x(64, 64) for _ in range(3)])
+        self.up_low = nn.ModuleList([UpSampling2x(d_l, d_l) for _ in range(4)])
         fusion_in_ch = 64 + d_l
         self.fusion_conv = nn.Sequential(
             nn.Conv2d(fusion_in_ch, 96, kernel_size=1, bias=False),
@@ -570,47 +589,69 @@ class SSC_GT(nn.Module):
         self.head_low = MaskHead(in_ch=d_l)
         self.head_high = MaskHead(in_ch=64)
         self.head_fusion = MaskHead(in_ch=64)
+        self.fiem = FIEMHead(ch_high=d_h, ch_low=d_l, mid_ch=64, max_steps=4)
 
-    def forward(self, img: torch.Tensor):
-        t = self.tokenizer(img)
-        feat_h_map = t["feat_h_map"]
-        tokens_h = t["tokens_h"]
-        patches_h = t["patches_h"]
-        H_h = t["H_h"]
-        W_h = t["W_h"]
-        feat_l_map = t["feat_l_map"]
-        tokens_l = t["tokens_l"]
-        patches_l = t["patches_l"]
-        H_l = t["H_l"]
-        W_l = t["W_l"]
-        H0 = t["H0"]
-        W0 = t["W0"]
+        self.gf1_1 = GroupFusion(320, 128)
+        self.gf1_2 = GroupFusion(128, 64)
+        self.gf1_3 = GroupFusion(64, 64, end=True)
 
-        th = self.sala_h(tokens_h, patches_h, H_h, W_h)
-        tl = self.sala_l(tokens_l, patches_l, H_l, W_l)
+        self.gf2_2 = GroupFusion(128, 64)
+        self.gf2_3 = GroupFusion(64, 64, end=True)
 
-        gh = self.acga_h(th)
-        gl = self.acga_l(tl)
-
-        e_tokens, edge_map = self.bacep(img, feat_h_map)
-
-        Eh = gh * (1.0 + 1.0 * e_tokens.unsqueeze(-1))
-
-        Fh, Fl = self.adpd(Eh, gl, e_tokens)
-
-        recon_high = self.decoder(Fh, H0=H0, W0=W0, stride=t["s_h"])
-        B = Fh.shape[0]
-        Fl_map = Fl.transpose(1, 2).contiguous().reshape(B, Fl.shape[2], H_l, W_l)
-        Fl_up = F.interpolate(
-            Fl_map, size=(H0, W0), mode="bilinear", align_corners=False
+        self.out_F1 = nn.Sequential(
+            nn.Conv2d(128, 128, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
         )
 
-        high_mask = self.head_high(recon_high)
-        low_mask = self.head_low(Fl_up)
-        fusion_in = torch.cat([recon_high, Fl_up], dim=1)
-        fusion_feat = self.fusion_conv(fusion_in)
-        fusion_mask = self.head_fusion(fusion_feat)
+        self.out_F2 = nn.Sequential(
+            nn.Conv2d(128, 128, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
 
+    def cim_decoder(self, tokens):
+        f = []
+        size = [96, 96, 48, 48, 24, 24, 24, 24, 48, 48, 96, 96]
+        for i in range(len(tokens)):
+            b, _, c = tokens[i].shape
+            f.append(
+                tokens[i].permute(0, 2, 1).view(b, c, size[i], size[i]).contiguous()
+            )
+
+        f1_1, f1_2 = self.gf1_1(f[7], f[4], f[5], f[6])
+
+        f2_1, f2_2 = self.gf1_2(f[9], f[8], f1_1, f1_2)
+        f2_3, f2_4 = self.gf2_2(f[3], f[2], f1_1, f1_2)
+
+        f3_1, f3_2 = self.gf1_3(f[11], f[10], f2_2, f2_1)
+        f3_3, f3_4 = self.gf2_3(f[1], f[0], f2_3, f2_4)
+
+        fout1 = self.out_F1(torch.cat([f3_1, f3_2], dim=1))  # (B,128,96,96)
+        fout2 = self.out_F2(torch.cat([f3_3, f3_4], dim=1))  # (B,128,48,48)
+        return fout1, fout2  # high, low
+
+    def forward(self, img: torch.Tensor):
+        x = self.encoder(img)
+        enc_high, enc_low = self.cim_decoder(x)  # (B,128,96,96) and (B,128,48,48)
+        B, C, H0, W0 = img.shape
+        th = self.sala_h(enc_high)
+        tl = self.sala_l(enc_low)
+        gh = self.acga_h(th)
+        gl = self.acga_l(tl)
+        low_mask, high_mask, fusion_mask = self.fiem(gh, gl, H0, W0)
         return [low_mask, high_mask, fusion_mask]
 
 
@@ -621,8 +662,9 @@ def get_model(**kwargs):
 if __name__ == "__main__":
     device = torch.device("cpu")
     model = get_model().to(device)
-    x = torch.randn(1, 3, 512, 512, device=device)
+    x = torch.randn(1, 3, 384, 384, device=device)
     out = model(x)
     print("Outputs:")
     for i, o in enumerate(out):
         print(f"  mask[{i}]:", o.shape)
+    print(f"number of parameters: {sum(p.numel() for p in model.parameters()):,}")

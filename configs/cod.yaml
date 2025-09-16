@@ -8,6 +8,16 @@ data:
   extensions: [".png", ".jpg", ".jpeg", ".bmp", ".tiff"]
 
 model:
+  encoder: 
+    patch_size: [7, 3, 3, 0.5, 0.5]
+    embed_dims: [64, 128, 320, 128, 64]
+    num_heads: [1, 2, 5, 2, 1]
+    mlp_ratios: [4, 4, 4, 4, 4]
+    qkv_bias: True
+    depths: [3, 6, 40, 6, 3]
+    sr_ratios: [8, 4, 2, 1, 1]
+    drop_rate: 0.0
+    drop_path_rate: 0.1
   in_ch: 3 
   d_h: 128 
   p_h: 8 
@@ -15,6 +25,7 @@ model:
   d_l: 128 
   p_l: 32 
   window_size: 7
+  
 
 training:
   model_dir: "./outputs_COD/"
